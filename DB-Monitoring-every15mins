@@ -1,0 +1,210 @@
+USE master;
+GO
+
+IF DB_ID('DBA_Monitor') IS NULL
+    CREATE DATABASE DBA_Monitor;
+GO
+
+USE DBA_Monitor;
+GO
+
+IF OBJECT_ID('dbo.ServerHealthSnapshot') IS NULL
+BEGIN
+    CREATE TABLE dbo.ServerHealthSnapshot
+    (
+        SnapshotID              BIGINT IDENTITY(1,1) PRIMARY KEY,
+        SnapshotTime            DATETIME2(0) NOT NULL DEFAULT SYSUTCDATETIME(),
+
+        -- Memory
+        TotalPhysicalMemoryMB   INT     NULL,
+        AvailableMemoryMB       INT     NULL,
+        SqlTotalMemoryMB        INT     NULL,
+        SqlTargetMemoryMB       INT     NULL,
+        PageLifeExpectancy      INT     NULL,
+        MemoryGrantsPending     INT     NULL,
+
+        -- CPU (from schedulers – shows pressure)
+        CpuRunnableTasksCount   INT     NULL,
+        CpuWorkerCount          INT     NULL,
+
+        -- IO (cumulative – you can diff in reports)
+        IoReadStallMs           BIGINT  NULL,
+        IoWriteStallMs          BIGINT  NULL,
+        IoNumReads              BIGINT  NULL,
+        IoNumWrites             BIGINT  NULL,
+
+        -- Simple flags (0/1) for “pressure”
+        MemoryPressureFlag      BIT     NULL,
+        CpuPressureFlag         BIT     NULL
+    );
+END
+GO
+
+
+
+
+======================================================
+
+USE DBA_Monitor;
+GO
+
+IF OBJECT_ID('dbo.usp_CollectServerHealth', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_CollectServerHealth;
+GO
+
+CREATE PROCEDURE dbo.usp_CollectServerHealth
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE
+        @TotalPhysMB            INT,
+        @AvailPhysMB            INT,
+        @SqlTotalMB             INT,
+        @SqlTargetMB            INT,
+        @PLE                    INT,
+        @MemGrantsPending       INT,
+        @CpuRunnableTasks       INT,
+        @CpuWorkers             INT,
+        @IoReadStallMs          BIGINT,
+        @IoWriteStallMs         BIGINT,
+        @IoNumReads             BIGINT,
+        @IoNumWrites            BIGINT,
+        @MemPressureFlag        BIT,
+        @CpuPressureFlag        BIT,
+        @CpuCount               INT;
+
+    /* ---- CPU count from DMV ---- */
+    SELECT @CpuCount = cpu_count
+    FROM sys.dm_os_sys_info;
+
+    /* ---- Memory: OS ---- */
+    SELECT
+        @TotalPhysMB  = total_physical_memory_kb / 1024,
+        @AvailPhysMB  = available_physical_memory_kb / 1024
+    FROM sys.dm_os_sys_memory;
+
+    /* ---- SQL memory: from perf counters ---- */
+    SELECT
+        @SqlTotalMB  = MAX(CASE WHEN counter_name = 'Total Server Memory (KB)'
+                                THEN cntr_value END) / 1024,
+        @SqlTargetMB = MAX(CASE WHEN counter_name = 'Target Server Memory (KB)'
+                                THEN cntr_value END) / 1024
+    FROM sys.dm_os_performance_counters
+    WHERE object_name LIKE '%Memory Manager%'
+      AND counter_name IN ('Total Server Memory (KB)',
+                           'Target Server Memory (KB)');
+
+    /* ---- PLE ---- */
+    SELECT
+        @PLE = MAX(cntr_value)
+    FROM sys.dm_os_performance_counters
+    WHERE counter_name = 'Page life expectancy'
+      AND object_name LIKE '%Buffer Manager%';
+
+    /* ---- Memory Grants Pending ---- */
+    SELECT
+        @MemGrantsPending = MAX(cntr_value)
+    FROM sys.dm_os_performance_counters
+    WHERE counter_name = 'Memory Grants Pending';
+
+    /* ---- CPU pressure (scheduler view) ---- */
+    SELECT
+        @CpuRunnableTasks = SUM(runnable_tasks_count),
+        @CpuWorkers       = SUM(current_workers_count)
+    FROM sys.dm_os_schedulers
+    WHERE scheduler_id < 255   -- ignore DAC and hidden schedulers
+      AND status = 'VISIBLE ONLINE';
+
+    /* ---- IO cumulative stats ---- */
+    SELECT
+        @IoReadStallMs  = SUM(io_stall_read_ms),
+        @IoWriteStallMs = SUM(io_stall_write_ms),
+        @IoNumReads     = SUM(num_of_reads),
+        @IoNumWrites    = SUM(num_of_writes)
+    FROM sys.dm_io_virtual_file_stats(NULL, NULL);
+
+    /* ---- Simple pressure flags (tune thresholds per server) ---- */
+    SET @MemPressureFlag =
+        CASE
+            WHEN @MemGrantsPending > 0 OR (@PLE IS NOT NULL AND @PLE < 300) THEN 1
+            ELSE 0
+        END;
+
+    SET @CpuPressureFlag =
+        CASE
+            WHEN @CpuRunnableTasks > 2 * @CpuCount THEN 1
+            ELSE 0
+        END;
+
+    /* ---- Insert snapshot ---- */
+    INSERT INTO dbo.ServerHealthSnapshot
+    (
+        TotalPhysicalMemoryMB,
+        AvailableMemoryMB,
+        SqlTotalMemoryMB,
+        SqlTargetMemoryMB,
+        PageLifeExpectancy,
+        MemoryGrantsPending,
+        CpuRunnableTasksCount,
+        CpuWorkerCount,
+        IoReadStallMs,
+        IoWriteStallMs,
+        IoNumReads,
+        IoNumWrites,
+        MemoryPressureFlag,
+        CpuPressureFlag
+    )
+    VALUES
+    (
+        @TotalPhysMB,
+        @AvailPhysMB,
+        @SqlTotalMB,
+        @SqlTargetMB,
+        @PLE,
+        @MemGrantsPending,
+        @CpuRunnableTasks,
+        @CpuWorkers,
+        @IoReadStallMs,
+        @IoWriteStallMs,
+        @IoNumReads,
+        @IoNumWrites,
+        @MemPressureFlag,
+        @CpuPressureFlag
+    );
+END;
+GO
+
+
+
+===================================================================
+
+
+EXEC DBA_Monitor.dbo.usp_CollectServerHealth;
+
+SELECT TOP 5 *
+FROM DBA_Monitor.dbo.ServerHealthSnapshot
+ORDER BY SnapshotID DESC;
+
+
+..
+EXEC DBA_Monitor.dbo.usp_CollectServerHealth;
+
+
+SELECT TOP 5 *
+FROM DBA_Monitor.dbo.ServerHealthSnapshot
+ORDER BY SnapshotID DESC;
+
+
+SELECT name, enabled
+FROM msdb.dbo.sysjobs
+WHERE name = 'DBA – Collect Server Health Snapshot';
+
+EXEC msdb.dbo.sp_help_job
+    @job_name = 'DBA – Collect Server Health Snapshot';
+
+
+SELECT TOP 20 *
+FROM DBA_Monitor.dbo.ServerHealthSnapshot
+ORDER BY SnapshotTime DESC;
+
