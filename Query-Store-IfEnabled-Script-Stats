@@ -1,0 +1,203 @@
+/* -------- script to collect all health check stats for any pint in time -------- */
+/* -------- This is only useful if QUERY STORE is enabled for the database  -------- */
+/* -------- Author : Prashant Dixit -------- */
+/* -------- Team : DEVOPS TBSM TDBank Securities -------- */
+/* -------- Version : 1.8 -------- */
+/* -------- To run : First crerate the PROC and call  -------- */
+
+CREATE OR ALTER PROCEDURE dbo.qs_window_report
+  @Start DATETIME2,
+  @End   DATETIME2,
+  @Top   INT = 20
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  /* Guard: Query Store must be enabled */
+  IF NOT EXISTS (
+      SELECT 1
+      FROM sys.database_query_store_options
+      WHERE actual_state_desc IN ('READ_WRITE','READ_ONLY')
+  )
+  BEGIN
+    RAISERROR('Query Store is not enabled for this database.', 16, 1);
+    RETURN;
+  END
+
+  /* -------- Base windowed data into a temp table (version-safe columns) -------- */
+  IF OBJECT_ID('tempdb..#QS') IS NOT NULL DROP TABLE #QS;
+  CREATE TABLE #QS
+  (
+    query_id            BIGINT NOT NULL,
+    plan_id             BIGINT NOT NULL,
+    count_executions    BIGINT NOT NULL,
+    avg_duration        FLOAT  NULL,
+    avg_cpu_time        FLOAT  NULL,
+    avg_logical_reads   FLOAT  NULL,
+    avg_logical_writes  FLOAT  NULL,
+    last_execution_time DATETIME2 NULL,
+    query_sql_text      NVARCHAR(MAX) NULL
+  );
+
+  INSERT INTO #QS (query_id, plan_id, count_executions, avg_duration, avg_cpu_time,
+                   avg_logical_reads, avg_logical_writes, last_execution_time, query_sql_text)
+  SELECT
+      q.query_id,
+      rs.plan_id,
+      rs.count_executions,
+      rs.avg_duration,
+      rs.avg_cpu_time,
+      rs.avg_logical_io_reads,
+      rs.avg_logical_io_writes,
+      rs.last_execution_time,
+      qt.query_sql_text
+  FROM sys.query_store_runtime_stats              AS rs
+  JOIN sys.query_store_plan                       AS p   ON rs.plan_id = p.plan_id
+  JOIN sys.query_store_query                      AS q   ON p.query_id = q.query_id
+  JOIN sys.query_store_query_text                 AS qt  ON q.query_text_id = qt.query_text_id
+  JOIN sys.query_store_runtime_stats_interval     AS rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+  WHERE rsi.start_time <  @End
+    AND rsi.end_time   >  @Start;
+
+  /* -------- 1) Top by elapsed time (duration) -------- */
+  SELECT TOP (@Top)
+      query_id,
+      execs             = SUM(count_executions),
+      total_duration_ms = SUM(avg_duration * count_executions),
+      last_exec         = MAX(last_execution_time),
+      query_sql_text    = MAX(query_sql_text)
+  FROM #QS
+  GROUP BY query_id
+  ORDER BY total_duration_ms DESC;
+
+  /* -------- 2) Top by CPU time -------- */
+  SELECT TOP (@Top)
+      query_id,
+      execs        = SUM(count_executions),
+      total_cpu_ms = SUM(avg_cpu_time * count_executions),
+      last_exec    = MAX(last_execution_time),
+      query_sql_text = MAX(query_sql_text)
+  FROM #QS
+  GROUP BY query_id
+  ORDER BY total_cpu_ms DESC;
+
+  /* -------- 3) Top by logical reads -------- */
+  SELECT TOP (@Top)
+      query_id,
+      execs               = SUM(count_executions),
+      total_logical_reads = SUM(avg_logical_reads * count_executions),
+      last_exec           = MAX(last_execution_time),
+      query_sql_text      = MAX(query_sql_text)
+  FROM #QS
+  GROUP BY query_id
+  ORDER BY total_logical_reads DESC;
+
+  /* -------- 4) Top by logical writes -------- */
+  SELECT TOP (@Top)
+      query_id,
+      execs                = SUM(count_executions),
+      total_logical_writes = SUM(avg_logical_writes * count_executions),
+      last_exec            = MAX(last_execution_time),
+      query_sql_text       = MAX(query_sql_text)
+  FROM #QS
+  GROUP BY query_id
+  ORDER BY total_logical_writes DESC;
+
+  /* -------- 5) Top by transaction log bytes (only if column exists) -------- */
+  IF COL_LENGTH('sys.query_store_runtime_stats','avg_log_bytes_used') IS NOT NULL
+  BEGIN
+    DECLARE @sql NVARCHAR(MAX) =
+    N'SELECT TOP (@Top)
+         q.query_id,
+         execs           = SUM(rs.count_executions),
+         total_log_bytes = SUM(rs.avg_log_bytes_used * rs.count_executions),
+         last_exec       = MAX(rs.last_execution_time),
+         query_sql_text  = MAX(qt.query_sql_text)
+       FROM sys.query_store_runtime_stats rs
+       JOIN sys.query_store_plan                   p   ON rs.plan_id = p.plan_id
+       JOIN sys.query_store_query                  q   ON p.query_id = q.query_id
+       JOIN sys.query_store_query_text             qt  ON q.query_text_id = qt.query_text_id
+       JOIN sys.query_store_runtime_stats_interval rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+       WHERE rsi.start_time <  @End AND rsi.end_time > @Start
+       GROUP BY q.query_id
+       ORDER BY total_log_bytes DESC;';
+    EXEC sp_executesql @sql, N'@Start DATETIME2, @End DATETIME2, @Top INT',
+                       @Start=@Start, @End=@End, @Top=@Top;
+  END
+  ELSE
+  BEGIN
+    SELECT info_message = N'avg_log_bytes_used not available on this SQL Server version/build.';
+  END
+
+  /* -------- 6) Locking pressure (QS wait stats: LCK) -------- */
+  IF OBJECT_ID('tempdb..#LCK') IS NOT NULL DROP TABLE #LCK;
+  CREATE TABLE #LCK(query_id BIGINT, total_lock_wait_ms BIGINT);
+  INSERT INTO #LCK(query_id, total_lock_wait_ms)
+  SELECT
+      q.query_id,
+      SUM(w.total_query_wait_time_ms) AS total_lock_wait_ms
+  FROM sys.query_store_wait_stats              AS w
+  JOIN sys.query_store_plan                    AS p   ON w.plan_id = p.plan_id
+  JOIN sys.query_store_query                   AS q   ON p.query_id = q.query_id
+  JOIN sys.query_store_runtime_stats_interval  AS rsi ON w.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+  WHERE rsi.start_time <  @End
+    AND rsi.end_time   >  @Start
+    AND w.wait_category_desc = 'LCK'
+  GROUP BY q.query_id;
+
+  SELECT TOP (@Top)
+      l.query_id,
+      l.total_lock_wait_ms,
+      qt.query_sql_text
+  FROM #LCK AS l
+  JOIN sys.query_store_query      AS q  ON q.query_id = l.query_id
+  JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+  ORDER BY l.total_lock_wait_ms DESC;
+
+  /* -------- 7) Deadlocks in window (system_health XE) -------- */
+  BEGIN TRY
+    ;WITH X AS (
+      SELECT CAST(xet.target_data AS XML) AS td
+      FROM sys.dm_xe_session_targets xet
+      JOIN sys.dm_xe_sessions xs
+        ON xs.address = xet.event_session_address
+      WHERE xs.name = 'system_health' AND xet.target_name = 'ring_buffer'
+    )
+    SELECT
+      dl_time = n.value('(action[@name="ts"]/@timestamp)[1]', 'datetime2'),
+      victim  = n.value('(data[@name="victim"]/value)[1]', 'nvarchar(100)'),
+      deadlock_graph = n.query('.')
+    FROM X
+    CROSS APPLY td.nodes('//event[@name="xml_deadlock_report"]') AS q(n)
+    WHERE n.value('(action[@name="ts"]/@timestamp)[1]', 'datetime2') BETWEEN @Start AND @End
+    ORDER BY dl_time DESC;
+  END TRY
+  BEGIN CATCH
+    SELECT info_message = N'system_health Extended Events session not available; skipping deadlocks output.';
+  END CATCH;
+
+  /* -------- 8) Live memory grants (current view, not time-sliced) -------- */
+  SELECT TOP (@Top)
+    mg.session_id,
+    requested_mb = mg.requested_memory_kb/1024.0,
+    granted_mb   = mg.granted_memory_kb/1024.0,
+    ideal_mb     = mg.ideal_memory_kb/1024.0,
+    wait_time_ms = mg.wait_time_ms,
+    dop          = mg.dop,
+    start_time   = mg.request_time,
+    sql_text     = txt.text
+  FROM sys.dm_exec_query_memory_grants AS mg
+  CROSS APPLY sys.dm_exec_sql_text(mg.sql_handle) AS txt
+  ORDER BY granted_mb DESC, requested_mb DESC;
+END
+GO
+
+
+
+
+#################################################################################
+USE [benchmarking_2 DB];  -- or the target DB
+EXEC dbo.qs_window_report
+  @Start = '2025-10-30 09:46',
+  @End   = '2025-10-30 11:10',
+  @Top   = 20;
